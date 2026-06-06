@@ -14,7 +14,94 @@ const LANGUAGES = [
   { label: '🇳🇱 荷兰语', srLang: 'nl-NL', apiLang: 'nl', flag: '🇳🇱' },
 ];
 
-// 浏览器兼容性检测函数
+// ── 新增：翻译缓存 ──
+const translationCache = new Map();
+const MAX_CACHE_SIZE = 200;
+
+// ── 新增：带超时的 fetch ──
+const fetchWithTimeout = (url, options = {}, timeout = 5000) => {
+  return Promise.race([
+    fetch(url, options),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('请求超时')), timeout)
+    )
+  ]);
+};
+
+// ── 新增：3 个翻译源 ──
+const translateWithMyMemory = async (text, sourceLang, signal) => {
+  const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${sourceLang}|zh`;
+  const res = await fetchWithTimeout(url, { signal }, 3000);
+  const data = await res.json();
+  let out = data?.responseData?.translatedText || '';
+  out = out.replace(/@\S+/g, '').trim();
+  return out || '[翻译为空]';
+};
+
+const translateWithLibre = async (text, sourceLang, signal) => {
+  const langMap = { en: 'en', ja: 'ja', fr: 'fr', de: 'de', es: 'es', ko: 'ko', ru: 'ru', it: 'it', pt: 'pt', nl: 'nl' };
+  const targetLang = langMap[sourceLang] || 'en';
+  const url = `https://libretranslate.de/translate`;
+  const res = await fetchWithTimeout(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ q: text, source: targetLang, target: 'zh', format: 'text' }),
+    signal
+  }, 3000);
+  const data = await res.json();
+  return data?.translatedText || '[翻译为空]';
+};
+
+const translateWithGoogleMirror = async (text, sourceLang, signal) => {
+  const langMap = { en: 'en', ja: 'ja', fr: 'fr', de: 'de', es: 'es', ko: 'ko', ru: 'ru', it: 'it', pt: 'pt', nl: 'nl' };
+  const sl = langMap[sourceLang] || 'auto';
+  const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sl}&tl=zh&dt=t&q=${encodeURIComponent(text)}`;
+  const res = await fetchWithTimeout(url, { signal }, 3000);
+  const data = await res.json();
+  if (data && Array.isArray(data[0])) {
+    return data[0].map(item => item[0]).join('');
+  }
+  return '[翻译为空]';
+};
+
+// ── 新增：主翻译函数 ──
+const translateText = async (text, sourceLang, signal) => {
+  if (!text || !text.trim()) return '';
+  const trimmed = text.trim().slice(0, 500);
+  const key = `${sourceLang}:${trimmed}`;
+
+  if (translationCache.has(key)) {
+    return translationCache.get(key);
+  }
+
+  const sources = [
+    () => translateWithGoogleMirror(trimmed, sourceLang, signal),
+    () => translateWithMyMemory(trimmed, sourceLang, signal),
+    () => translateWithLibre(trimmed, sourceLang, signal)
+  ];
+
+  for (const source of sources) {
+    try {
+      const result = await source();
+      if (result && !result.startsWith('[翻译失败') && !result.startsWith('[翻译为空')) {
+        if (translationCache.size >= MAX_CACHE_SIZE) {
+          const firstKey = translationCache.keys().next().value;
+          translationCache.delete(firstKey);
+        }
+        translationCache.set(key, result);
+        return result;
+      }
+    } catch (err) {
+      if (err.name === 'AbortError') return null;
+      console.warn('翻译源失败:', err.message);
+    }
+  }
+  return '[翻译失败，请检查网络]';
+};
+
+// ═══════════════════════════════════════════════════════════════════
+//  浏览器兼容性检测 — 异步探测
+// ═══════════════════════════════════════════════════════════════════
 const probeSpeechRecognition = () => {
   return new Promise((resolve) => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -56,9 +143,7 @@ const probeSpeechRecognition = () => {
       }
     };
 
-    try {
-      rec.start();
-    } catch (err) {
+    try { rec.start(); } catch (err) {
       resolve({ supported: false, reason: '无法启动语音识别', canUseFallback: true });
       return;
     }
@@ -76,14 +161,15 @@ export default function App() {
   const [isListening, setIsListening] = useState(false);
   const [finalTranscript, setFinalTranscript] = useState('');
   const [interimTranscript, setInterimTranscript] = useState('');
-  const [translatedText, setTranslatedText] = useState('');
+  const [translatedText, setTranslatedText] = useState('');       // 译文
+  const [prevTranslation, setPrevTranslation] = useState('');     // 新增：上一次翻译（用于修正对比）
   const [history, setHistory] = useState([]);
   const [volume, setVolume] = useState(0);
   const [speakEnabled, setSpeakEnabled] = useState(false);
   const [status, setStatus] = useState('空闲');
   const [statusType, setStatusType] = useState('idle');
   const [langIndex, setLangIndex] = useState(0);
-  const [correctionCount, setCorrectionCount] = useState(0);
+  const [correctionCount, setCorrectionCount] = useState(0);      // 新增：自动修正次数统计
   const [browserInfo, setBrowserInfo] = useState({ supported: true, reason: '', canUseFallback: true });
 
   const isListeningRef = useRef(false);
@@ -97,10 +183,19 @@ export default function App() {
   const lastErrorRef = useRef(null);
   const langIndexRef = useRef(0);
   const finalTranscriptRef = useRef('');
+  const abortCtrlRef = useRef(null);          // 新增：用于取消翻译请求
+  const debounceRef = useRef(null);           // 新增：用于防抖
+  const pendingFinalRef = useRef('');         // 新增：等待翻译的 final 文本
+  const translatedTextRef = useRef('');       // 新增：用于 stopListening 闭包安全
 
   useEffect(() => {
     langIndexRef.current = langIndex;
   }, [langIndex]);
+
+  // 同步 translatedText → ref
+  useEffect(() => {
+    translatedTextRef.current = translatedText;
+  }, [translatedText]);
 
   // 启动时检测浏览器兼容性
   useEffect(() => {
@@ -238,8 +333,43 @@ export default function App() {
         setFinalTranscript(prev => {
           const next = (prev + final).slice(-3000);
           finalTranscriptRef.current = next.trim();
+          pendingFinalRef.current = next.trim(); // 更新待翻译文本
           return next;
         });
+        // ── 新增：触发翻译 ──
+        if (debounceRef.current) clearTimeout(debounceRef.current);
+        if (abortCtrlRef.current) abortCtrlRef.current.abort();
+
+        debounceRef.current = setTimeout(async () => {
+          const ctrl = new AbortController();
+          abortCtrlRef.current = ctrl;
+
+          setStatus('翻译中...');
+          setStatusType('translating');
+
+          const fullText = finalTranscriptRef.current.trim();
+          if (!fullText) {
+            setStatus('空闲');
+            setStatusType('idle');
+            return;
+          }
+
+          const lang = LANGUAGES[langIndexRef.current];
+          const result = await translateText(fullText, lang.apiLang, ctrl.signal);
+
+          if (result === null) return; // 被 abort
+
+          if (result && result !== prevTranslation && prevTranslation) {
+            setCorrectionCount(c => c + 1);
+          }
+          setPrevTranslation(result || '');
+          setTranslatedText(result || '');
+
+          if (isListeningRef.current) {
+            setStatus('聆听中...');
+            setStatusType('listening');
+          }
+        }, 150); // 防抖 150ms
       }
       setInterimTranscript(interim);
     };
@@ -288,10 +418,12 @@ export default function App() {
     setFinalTranscript('');
     setInterimTranscript('');
     setTranslatedText('');
+    setPrevTranslation('');
     setCorrectionCount(0);
     retryCountRef.current = 0;
     lastErrorRef.current = null;
     finalTranscriptRef.current = '';
+    pendingFinalRef.current = '';
 
     isListeningRef.current = true;
     setIsListening(true);
@@ -322,11 +454,27 @@ export default function App() {
       audioContextRef.current = null;
     }
     if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (abortCtrlRef.current) abortCtrlRef.current.abort();
 
     setVolume(0);
     setStatus('已停止');
     setStatusType('idle');
     window.speechSynthesis?.cancel();
+
+    // ── 新增：停止时把当前内容写入历史 ──
+    const finalText = finalTranscriptRef.current?.trim() || finalTranscript.trim();
+    const translated = translatedTextRef.current.trim();
+    if (finalText && translated && translated !== '识别中...') {
+      const now = new Date().toLocaleTimeString();
+      setHistory(prev => {
+        const newId = Date.now();
+        return [
+          { id: newId, original: finalText, translation: translated, time: now, corrected: false },
+          ...prev.slice(0, 39),
+        ];
+      });
+    }
   }, []);
 
   useEffect(() => {
@@ -346,6 +494,8 @@ export default function App() {
         audioContextRef.current = null;
       }
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      if (abortCtrlRef.current) abortCtrlRef.current.abort();
       window.speechSynthesis?.cancel();
     };
   }, []);
@@ -369,6 +519,7 @@ export default function App() {
     const edited = window.prompt('手动修正译文：', translatedText);
     if (edited && edited.trim()) {
       setTranslatedText(edited.trim());
+      setPrevTranslation(edited.trim()); // 同步更新
     }
   };
 
@@ -404,6 +555,11 @@ export default function App() {
               <h1 className="app-title">AI 同声传译助手</h1>
               <p className="app-desc">外语演讲 · 技术分享 · 国际会议 · 网课 → 实时中文字幕 + 语音</p>
             </div>
+            {correctionCount > 0 && (
+              <div className="correction-badge">
+                <span>✨ 已修正 {correctionCount} 次</span>
+              </div>
+            )}
           </div>
         </header>
 
@@ -482,7 +638,7 @@ export default function App() {
             <div className="panel-body target-text">
               {translatedText || (
                 <span className="placeholder-text">
-                  {isListening ? <><span className="trans-spinner">⟳</span> 翻译功能待添加...</> : '翻译结果将显示在这里'}
+                  {isListening ? <><span className="trans-spinner">⟳</span> 翻译中...</> : '翻译结果将显示在这里'}
                 </span>
               )}
             </div>
@@ -498,7 +654,7 @@ export default function App() {
             {history.length === 0 ? (
               <div className="history-empty">
                 <p>🔍 暂无记录</p>
-                <p>启动后，每次识别结果将在此记录</p>
+                <p>启动后，每次识别结果将在此记录；若 AI 自动修正了识别或翻译，该条目会标记 ✨</p>
               </div>
             ) : (
               history.map(item => (
@@ -516,8 +672,9 @@ export default function App() {
         </section>
 
         <footer className="app-footer">
-          <p>💡 <strong>使用方式：</strong>选择语言 → 开始传译 → 将麦克风对准外语扬声器或直接朗读。</p>
-          <p className="footer-note">支持 Chrome / Edge · Web Speech API 语音识别</p>
+          <p>💡 <strong>使用方式：</strong>选择语言 → 开始传译 → 将麦克风对准外语扬声器或直接朗读。
+            &nbsp;✨ <strong>自动修正：</strong>识别结果持续更新，翻译随之实时修正，确保准确性。</p>
+          <p className="footer-note">支持 Chrome / Edge · Web Speech API + MyMemory / LibreTranslate / Google 镜像翻译</p>
         </footer>
       </div>
     </div>
