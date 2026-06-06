@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import './App.css';
 
 const LANGUAGES = [
@@ -14,6 +14,64 @@ const LANGUAGES = [
   { label: '🇳🇱 荷兰语', srLang: 'nl-NL', apiLang: 'nl', flag: '🇳🇱' },
 ];
 
+// 浏览器兼容性检测函数
+const probeSpeechRecognition = () => {
+  return new Promise((resolve) => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      resolve({ supported: false, reason: '您的浏览器不支持 Web Speech API', canUseFallback: true });
+      return;
+    }
+
+    const rec = new SR();
+    rec.continuous = false;
+    rec.interimResults = false;
+    rec.lang = 'en-US';
+
+    let hasResult = false;
+    let hasError = false;
+    let errorType = null;
+
+    rec.onresult = () => { hasResult = true; };
+
+    rec.onerror = (e) => {
+      hasError = true;
+      errorType = e.error;
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+        rec.abort();
+        resolve({
+          supported: false,
+          reason: '麦克风权限被拒绝，请允许麦克风访问',
+          canUseFallback: true
+        });
+      }
+    };
+
+    rec.onend = () => {
+      if (!hasResult && !hasError) {
+        resolve({ supported: true, reason: '', canUseFallback: true });
+      }
+      if (hasError && errorType === 'network') {
+        resolve({ supported: true, reason: '', canUseFallback: true });
+      }
+    };
+
+    try {
+      rec.start();
+    } catch (err) {
+      resolve({ supported: false, reason: '无法启动语音识别', canUseFallback: true });
+      return;
+    }
+
+    setTimeout(() => {
+      try { rec.stop(); } catch (_) { }
+      if (!hasError || errorType === 'network') {
+        resolve({ supported: true, reason: '', canUseFallback: true });
+      }
+    }, 2000);
+  });
+};
+
 export default function App() {
   const [isListening, setIsListening] = useState(false);
   const [finalTranscript, setFinalTranscript] = useState('');
@@ -26,9 +84,285 @@ export default function App() {
   const [statusType, setStatusType] = useState('idle');
   const [langIndex, setLangIndex] = useState(0);
   const [correctionCount, setCorrectionCount] = useState(0);
+  const [browserInfo, setBrowserInfo] = useState({ supported: true, reason: '', canUseFallback: true });
+
+  const isListeningRef = useRef(false);
+  const recognitionRef = useRef(null);
+  const mediaStreamRef = useRef(null);
+  const audioContextRef = useRef(null);
+  const analyserRef = useRef(null);
+  const animFrameRef = useRef(null);
+  const retryTimerRef = useRef(null);
+  const retryCountRef = useRef(0);
+  const lastErrorRef = useRef(null);
+  const langIndexRef = useRef(0);
+  const finalTranscriptRef = useRef('');
+
+  useEffect(() => {
+    langIndexRef.current = langIndex;
+  }, [langIndex]);
+
+  // 启动时检测浏览器兼容性
+  useEffect(() => {
+    let cancelled = false;
+    setStatus('检测浏览器兼容性...');
+    setStatusType('translating');
+
+    probeSpeechRecognition().then(info => {
+      if (cancelled) return;
+      setBrowserInfo(info);
+      setStatus('空闲');
+      setStatusType('idle');
+    });
+
+    return () => { cancelled = true; };
+  }, []);
+
+  const initRecognition = useCallback((langIdx) => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      alert('您的浏览器不支持 Web Speech API，请使用 Chrome 或 Edge 浏览器');
+      return null;
+    }
+    const rec = new SR();
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang = LANGUAGES[langIdx].srLang;
+    rec.maxAlternatives = 1;
+
+    rec.onstart = () => {
+      retryCountRef.current = 0;
+      lastErrorRef.current = null;
+      setStatus('聆听中...');
+      setStatusType('listening');
+    };
+
+    rec.onerror = (e) => {
+      lastErrorRef.current = e.error;
+      console.warn('[SR] error:', e.error);
+      switch (e.error) {
+        case 'not-allowed':
+        case 'service-not-allowed':
+          alert('麦克风权限被拒绝，请在浏览器地址栏点击锁图标允许麦克风访问后重试');
+          stopListening();
+          break;
+        case 'audio-capture':
+          setStatus('麦克风不可用');
+          setStatusType('error');
+          stopListening();
+          break;
+        case 'network':
+          setStatus('网络连接失败，重试中...');
+          setStatusType('retrying');
+          break;
+        case 'no-speech':
+          setStatus('等待语音...');
+          setStatusType('listening');
+          break;
+        default:
+          setStatus(`识别错误: ${e.error}`);
+          setStatusType('error');
+      }
+    };
+
+    rec.onend = () => {
+      if (!isListeningRef.current) {
+        setStatus('已停止');
+        setStatusType('idle');
+        return;
+      }
+
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+
+      if (!lastErrorRef.current) {
+        retryTimerRef.current = setTimeout(() => {
+          if (!isListeningRef.current) return;
+          try {
+            const newRec = initRecognition(langIndexRef.current);
+            if (newRec) {
+              recognitionRef.current = newRec;
+              newRec.start();
+            }
+          } catch (err) {
+            console.warn('[SR] restart failed:', err);
+          }
+        }, 1500);
+        return;
+      }
+
+      let delay = 300;
+      if (lastErrorRef.current === 'network') {
+        retryCountRef.current = Math.min(retryCountRef.current + 1, 3);
+        if (retryCountRef.current >= 3) {
+          setStatus('网络错误，无法连接语音识别服务');
+          setStatusType('error');
+          stopListening();
+          return;
+        }
+        delay = Math.min(1000 * (2 ** (retryCountRef.current - 1)), 8000);
+        const secs = Math.round(delay / 1000);
+        setStatus(`网络错误，${secs}s 后重试 (${retryCountRef.current}/3)`);
+        setStatusType('retrying');
+      } else if (lastErrorRef.current === 'no-speech') {
+        delay = 1000;
+        setStatus('等待语音...');
+        setStatusType('listening');
+      }
+
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = setTimeout(() => {
+        if (!isListeningRef.current) return;
+        try {
+          const newRec = initRecognition(langIndexRef.current);
+          if (newRec) {
+            recognitionRef.current = newRec;
+            newRec.start();
+          }
+        } catch (err) {
+          console.warn('[SR] restart failed:', err);
+        }
+      }, delay);
+    };
+
+    rec.onresult = (e) => {
+      let interim = '', final = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const t = e.results[i][0].transcript;
+        if (e.results[i].isFinal) {
+          final += t + ' ';
+        } else {
+          interim += t;
+        }
+      }
+      if (final) {
+        setFinalTranscript(prev => {
+          const next = (prev + final).slice(-3000);
+          finalTranscriptRef.current = next.trim();
+          return next;
+        });
+      }
+      setInterimTranscript(interim);
+    };
+
+    return rec;
+  }, []);
+
+  const setupVolumeMeter = useCallback(async (stream) => {
+    if (audioContextRef.current) {
+      try { await audioContextRef.current.close(); } catch (_) { }
+    }
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    src.connect(analyser);
+    audioContextRef.current = ctx;
+    analyserRef.current = analyser;
+    if (ctx.state === 'suspended') await ctx.resume();
+
+    const buf = new Uint8Array(analyser.frequencyBinCount);
+    const tick = () => {
+      if (!isListeningRef.current) { setVolume(0); return; }
+      analyser.getByteFrequencyData(buf);
+      const avg = buf.reduce((s, v) => s + v, 0) / (buf.length || 1);
+      setVolume(Math.min(1, avg / 100));
+      animFrameRef.current = requestAnimationFrame(tick);
+    };
+    animFrameRef.current = requestAnimationFrame(tick);
+  }, []);
+
+  const startListening = async () => {
+    if (!browserInfo.supported) {
+      alert(`⚠️ ${browserInfo.reason}`);
+      return;
+    }
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+    } catch (err) {
+      alert('无法获取麦克风权限，请检查浏览器或系统设置');
+      return;
+    }
+
+    setFinalTranscript('');
+    setInterimTranscript('');
+    setTranslatedText('');
+    setCorrectionCount(0);
+    retryCountRef.current = 0;
+    lastErrorRef.current = null;
+    finalTranscriptRef.current = '';
+
+    isListeningRef.current = true;
+    setIsListening(true);
+
+    const rec = initRecognition(langIndex);
+    if (!rec) { isListeningRef.current = false; setIsListening(false); return; }
+    recognitionRef.current = rec;
+    rec.start();
+
+    await setupVolumeMeter(stream);
+  };
+
+  const stopListening = useCallback(() => {
+    isListeningRef.current = false;
+    setIsListening(false);
+
+    if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+    if (recognitionRef.current) {
+      try { recognitionRef.current.stop(); } catch (_) { }
+      recognitionRef.current = null;
+    }
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach(t => t.stop());
+      mediaStreamRef.current = null;
+    }
+    if (audioContextRef.current) {
+      audioContextRef.current.close().catch(() => { });
+      audioContextRef.current = null;
+    }
+    if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+
+    setVolume(0);
+    setStatus('已停止');
+    setStatusType('idle');
+    window.speechSynthesis?.cancel();
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      isListeningRef.current = false;
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+      if (recognitionRef.current) {
+        try { recognitionRef.current.stop(); } catch (_) { }
+        recognitionRef.current = null;
+      }
+      if (mediaStreamRef.current) {
+        mediaStreamRef.current.getTracks().forEach(t => t.stop());
+        mediaStreamRef.current = null;
+      }
+      if (audioContextRef.current) {
+        audioContextRef.current.close().catch(() => { });
+        audioContextRef.current = null;
+      }
+      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+      window.speechSynthesis?.cancel();
+    };
+  }, []);
 
   const handleLangChange = (e) => {
-    setLangIndex(Number(e.target.value));
+    const idx = Number(e.target.value);
+    setLangIndex(idx);
+    if (isListeningRef.current && recognitionRef.current) {
+      retryCountRef.current = 0;
+      lastErrorRef.current = null;
+      try { recognitionRef.current.stop(); } catch (_) { }
+      setTimeout(() => {
+        if (!isListeningRef.current) return;
+        const r = initRecognition(idx);
+        if (r) { recognitionRef.current = r; r.start(); }
+      }, 200);
+    }
   };
 
   const handleManualEdit = () => {
@@ -43,12 +377,26 @@ export default function App() {
     setCorrectionCount(0);
   };
 
+  const lang = LANGUAGES[langIndex];
+
   return (
     <div className="app-root">
       <div className="bg-glow glow-1" />
       <div className="bg-glow glow-2" />
 
       <div className="glass-shell">
+        {!browserInfo.supported && (
+          <div className="browser-warning">
+            <span className="bw-icon">⚠️</span>
+            <div className="bw-content">
+              <strong>当前浏览器不支持实时语音识别</strong>
+              <span className="bw-desc">
+                {browserInfo.reason}。建议使用 <strong>Google Chrome</strong> 或 <strong>Microsoft Edge</strong> 浏览器打开此页面。
+              </span>
+            </div>
+          </div>
+        )}
+
         <header className="app-header">
           <div className="logo-row">
             <span className="logo-icon">🎧</span>
@@ -56,18 +404,13 @@ export default function App() {
               <h1 className="app-title">AI 同声传译助手</h1>
               <p className="app-desc">外语演讲 · 技术分享 · 国际会议 · 网课 → 实时中文字幕 + 语音</p>
             </div>
-            {correctionCount > 0 && (
-              <div className="correction-badge">
-                <span>✨ 已修正 {correctionCount} 次</span>
-              </div>
-            )}
           </div>
         </header>
 
         <section className="control-bar">
           <button
             className={`main-btn ${isListening ? 'main-btn--stop' : 'main-btn--start'}`}
-            onClick={() => setIsListening(!isListening)}
+            onClick={isListening ? stopListening : startListening}
           >
             <span className={`btn-dot ${isListening ? 'dot-pulse' : ''}`} />
             {isListening ? '停止传译' : '开始同声传译'}
@@ -103,7 +446,7 @@ export default function App() {
             <span className="toggle-track">
               <span className="toggle-thumb" />
             </span>
-            <span className="toggle-label">🔊 语音播报</span>
+            <span className="toggle-label">🔊 语音播报（功能待添加）</span>
           </label>
 
           <button className="clear-btn" onClick={clearHistory}>
@@ -114,8 +457,8 @@ export default function App() {
         <section className="subtitle-grid">
           <div className="subtitle-panel panel-source">
             <div className="panel-head">
-              <span className="panel-tag">{LANGUAGES[langIndex].flag} 原文</span>
-              <span className="panel-lang">{LANGUAGES[langIndex].label}</span>
+              <span className="panel-tag">{lang.flag} 原文</span>
+              <span className="panel-lang">{lang.label}</span>
             </div>
             <div className="panel-body source-text">
               {finalTranscript && <span className="final-text">{finalTranscript}</span>}
@@ -139,7 +482,7 @@ export default function App() {
             <div className="panel-body target-text">
               {translatedText || (
                 <span className="placeholder-text">
-                  {isListening ? <><span className="trans-spinner">⟳</span> 识别后自动翻译...</> : '翻译结果将显示在这里'}
+                  {isListening ? <><span className="trans-spinner">⟳</span> 翻译功能待添加...</> : '翻译结果将显示在这里'}
                 </span>
               )}
             </div>
@@ -174,7 +517,7 @@ export default function App() {
 
         <footer className="app-footer">
           <p>💡 <strong>使用方式：</strong>选择语言 → 开始传译 → 将麦克风对准外语扬声器或直接朗读。</p>
-          <p className="footer-note">支持 Chrome / Edge · Web Speech API + MyMemory 翻译</p>
+          <p className="footer-note">支持 Chrome / Edge · Web Speech API 语音识别</p>
         </footer>
       </div>
     </div>
