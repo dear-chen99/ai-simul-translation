@@ -14,11 +14,10 @@ const LANGUAGES = [
   { label: '🇳🇱 荷兰语', srLang: 'nl-NL', apiLang: 'nl', flag: '🇳🇱' },
 ];
 
-// ── 新增：翻译缓存 ──
+// ── 翻译缓存 ──
 const translationCache = new Map();
 const MAX_CACHE_SIZE = 200;
 
-// ── 新增：带超时的 fetch ──
 const fetchWithTimeout = (url, options = {}, timeout = 5000) => {
   return Promise.race([
     fetch(url, options),
@@ -28,7 +27,6 @@ const fetchWithTimeout = (url, options = {}, timeout = 5000) => {
   ]);
 };
 
-// ── 新增：3 个翻译源 ──
 const translateWithMyMemory = async (text, sourceLang, signal) => {
   const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${sourceLang}|zh`;
   const res = await fetchWithTimeout(url, { signal }, 3000);
@@ -64,7 +62,6 @@ const translateWithGoogleMirror = async (text, sourceLang, signal) => {
   return '[翻译为空]';
 };
 
-// ── 新增：主翻译函数 ──
 const translateText = async (text, sourceLang, signal) => {
   if (!text || !text.trim()) return '';
   const trimmed = text.trim().slice(0, 500);
@@ -97,6 +94,17 @@ const translateText = async (text, sourceLang, signal) => {
     }
   }
   return '[翻译失败，请检查网络]';
+};
+
+// ── 新增：TTS 语音播报 ──
+const speakChinese = (text) => {
+  if (!text || !window.speechSynthesis) return;
+  window.speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = 'zh-CN';
+  u.rate = 0.92;
+  u.pitch = 1;
+  window.speechSynthesis.speak(u);
 };
 
 // ═══════════════════════════════════════════════════════════════════
@@ -161,15 +169,15 @@ export default function App() {
   const [isListening, setIsListening] = useState(false);
   const [finalTranscript, setFinalTranscript] = useState('');
   const [interimTranscript, setInterimTranscript] = useState('');
-  const [translatedText, setTranslatedText] = useState('');       // 译文
-  const [prevTranslation, setPrevTranslation] = useState('');     // 新增：上一次翻译（用于修正对比）
+  const [translatedText, setTranslatedText] = useState('');
+  const [prevTranslation, setPrevTranslation] = useState('');
   const [history, setHistory] = useState([]);
   const [volume, setVolume] = useState(0);
-  const [speakEnabled, setSpeakEnabled] = useState(false);
+  const [speakEnabled, setSpeakEnabled] = useState(false); // 语音播报开关
   const [status, setStatus] = useState('空闲');
   const [statusType, setStatusType] = useState('idle');
   const [langIndex, setLangIndex] = useState(0);
-  const [correctionCount, setCorrectionCount] = useState(0);      // 新增：自动修正次数统计
+  const [correctionCount, setCorrectionCount] = useState(0);
   const [browserInfo, setBrowserInfo] = useState({ supported: true, reason: '', canUseFallback: true });
 
   const isListeningRef = useRef(false);
@@ -183,21 +191,19 @@ export default function App() {
   const lastErrorRef = useRef(null);
   const langIndexRef = useRef(0);
   const finalTranscriptRef = useRef('');
-  const abortCtrlRef = useRef(null);          // 新增：用于取消翻译请求
-  const debounceRef = useRef(null);           // 新增：用于防抖
-  const pendingFinalRef = useRef('');         // 新增：等待翻译的 final 文本
-  const translatedTextRef = useRef('');       // 新增：用于 stopListening 闭包安全
+  const abortCtrlRef = useRef(null);
+  const debounceRef = useRef(null);
+  const pendingFinalRef = useRef('');
+  const translatedTextRef = useRef('');
 
   useEffect(() => {
     langIndexRef.current = langIndex;
   }, [langIndex]);
 
-  // 同步 translatedText → ref
   useEffect(() => {
     translatedTextRef.current = translatedText;
   }, [translatedText]);
 
-  // 启动时检测浏览器兼容性
   useEffect(() => {
     let cancelled = false;
     setStatus('检测浏览器兼容性...');
@@ -333,10 +339,10 @@ export default function App() {
         setFinalTranscript(prev => {
           const next = (prev + final).slice(-3000);
           finalTranscriptRef.current = next.trim();
-          pendingFinalRef.current = next.trim(); // 更新待翻译文本
+          pendingFinalRef.current = next.trim();
           return next;
         });
-        // ── 新增：触发翻译 ──
+        // ── 触发翻译 ──
         if (debounceRef.current) clearTimeout(debounceRef.current);
         if (abortCtrlRef.current) abortCtrlRef.current.abort();
 
@@ -357,7 +363,7 @@ export default function App() {
           const lang = LANGUAGES[langIndexRef.current];
           const result = await translateText(fullText, lang.apiLang, ctrl.signal);
 
-          if (result === null) return; // 被 abort
+          if (result === null) return;
 
           if (result && result !== prevTranslation && prevTranslation) {
             setCorrectionCount(c => c + 1);
@@ -365,11 +371,14 @@ export default function App() {
           setPrevTranslation(result || '');
           setTranslatedText(result || '');
 
+          // ── 新增：TTS 语音播报 ──
+          if (speakEnabled && result) speakChinese(result);
+
           if (isListeningRef.current) {
             setStatus('聆听中...');
             setStatusType('listening');
           }
-        }, 150); // 防抖 150ms
+        }, 150);
       }
       setInterimTranscript(interim);
     };
@@ -462,7 +471,6 @@ export default function App() {
     setStatusType('idle');
     window.speechSynthesis?.cancel();
 
-    // ── 新增：停止时把当前内容写入历史 ──
     const finalText = finalTranscriptRef.current?.trim() || finalTranscript.trim();
     const translated = translatedTextRef.current.trim();
     if (finalText && translated && translated !== '识别中...') {
@@ -519,7 +527,9 @@ export default function App() {
     const edited = window.prompt('手动修正译文：', translatedText);
     if (edited && edited.trim()) {
       setTranslatedText(edited.trim());
-      setPrevTranslation(edited.trim()); // 同步更新
+      setPrevTranslation(edited.trim());
+      // ── 新增：TTS 语音播报 ──
+      if (speakEnabled) speakChinese(edited.trim());
     }
   };
 
@@ -602,7 +612,7 @@ export default function App() {
             <span className="toggle-track">
               <span className="toggle-thumb" />
             </span>
-            <span className="toggle-label">🔊 语音播报（功能待添加）</span>
+            <span className="toggle-label">🔊 语音播报</span>
           </label>
 
           <button className="clear-btn" onClick={clearHistory}>
@@ -672,9 +682,13 @@ export default function App() {
         </section>
 
         <footer className="app-footer">
-          <p>💡 <strong>使用方式：</strong>选择语言 → 开始传译 → 将麦克风对准外语扬声器或直接朗读。
-            &nbsp;✨ <strong>自动修正：</strong>识别结果持续更新，翻译随之实时修正，确保准确性。</p>
-          <p className="footer-note">支持 Chrome / Edge · Web Speech API + MyMemory / LibreTranslate / Google 镜像翻译</p>
+          <p>
+            💡 <strong>使用方式：</strong>选择语言 → 开始传译 → 将麦克风对准外语扬声器或直接朗读。
+            &nbsp;✨ <strong>自动修正：</strong>识别结果持续更新，翻译随之实时修正，确保准确性。
+          </p>
+          <p className="footer-note">
+            支持 Chrome / Edge · Web Speech API + MyMemory / LibreTranslate / Google 镜像翻译 · TTS 语音播报
+          </p>
         </footer>
       </div>
     </div>
