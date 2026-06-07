@@ -97,7 +97,7 @@ ai-simul-translation/
 
 ## 🎬 演示视频
 
-[点击观看演示视频]（请将 Bilibili/云盘链接粘贴此处）
+[点击观看演示视频]（https://www.bilibili.com/video/BV19nEs66EJe?vd_source=6660a7a5e178e8c4810cb91084bedd42）
 
 ## ⚠️ 注意事项
 
